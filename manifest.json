@@ -1,0 +1,7 @@
+{
+  "Version": "4.2.0",
+  "Dependencies": {
+    "Alife.Function.FunctionCaller": ""
+  },
+  "Environments": null
+}
