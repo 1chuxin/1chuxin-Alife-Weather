@@ -95,9 +95,11 @@ public sealed class WeatherRuleEngine
                 value = rule.Metric switch
                 {
                     "temp" => data.Now.Temp, "feels_like" => data.Now.Feels,
-                    "humidity" => data.Now.Humidity, "wind_speed" => data.Now.WindKph,
-                    "uv" => data.Now.Uv, "precip_mm" => data.Now.PrecipMm,
+                    "humidity" => data.Now.Humidity >= 0 ? data.Now.Humidity : double.NaN,
+                    "wind_speed" => data.Now.WindKph >= 0 ? data.Now.WindKph : double.NaN,
+                    "uv" => data.Now.Uv >= 0 ? data.Now.Uv : double.NaN, "precip_mm" => data.Now.PrecipMm,
                     "weather_code" => data.Now.Code,
+                    "aqi" => data.Air is { Aqi: >= 0 } ? data.Air.Aqi : double.NaN,
                     "temp_max" => today?.MaxC ?? double.NaN,
                     "temp_min" => today?.MinC ?? double.NaN,
                     _ => double.NaN,
@@ -114,6 +116,8 @@ public sealed class WeatherRuleEngine
                 break;
             case "intraday":
                 value = rule.Metric == "weather_code" ? data.Now.Code : data.Now.Temp;
+                // 变化基准与 IsHit 保持一致（baseline.TempNow/Code），否则推送文案里 {prev} 渲染成"未知"
+                prev = rule.Metric == "weather_code" ? baseline?.Code : baseline?.TempNow;
                 break;
             case "day_over_day":
                 value = DailyMetric(rule.Metric, today);
@@ -128,6 +132,8 @@ public sealed class WeatherRuleEngine
                     "thunder_prob" => today.Hourly.Max(h => h.ThunderProb),
                     "temp" => today.Hourly.Max(h => h.TempC),
                     "weather_code" => today.Hourly.OrderBy(h => h.Time).Last().Code,
+                    "precip_mm" => today.Hourly.Sum(h => h.PrecipMm > 0 ? h.PrecipMm : 0),
+                    "uv" => today.Hourly.Where(h => h.Uv >= 0).Select(h => h.Uv).DefaultIfEmpty(double.NaN).Max(),
                     _ => double.NaN,
                 };
                 break;
@@ -145,8 +151,13 @@ public sealed class WeatherRuleEngine
     static double DailyMetric(string metric, DayForecast? day) => day == null ? double.NaN : metric switch
     {
         "temp_max" => day.MaxC, "temp_min" => day.MinC,
-        "precip_prob" => day.Hourly.Count > 0 ? day.Hourly.Max(h => h.RainProb) : double.NaN,
+        "precip_prob" => day.PrecipProb >= 0 ? day.PrecipProb
+            : day.Hourly.Count > 0 ? day.Hourly.Max(h => h.RainProb) : double.NaN,
         "thunder_prob" => day.Hourly.Count > 0 ? day.Hourly.Max(h => h.ThunderProb) : double.NaN,
+        "precip_mm" => day.PrecipMm >= 0 ? day.PrecipMm : double.NaN,
+        "uv" => day.Uv >= 0 ? day.Uv : double.NaN,
+        "humidity" => day.Humidity >= 0 ? day.Humidity : double.NaN,
+        "wind_speed" => day.WindKph >= 0 ? day.WindKph : double.NaN,
         "weather_code" => day.DayCode,
         _ => double.NaN,
     };
@@ -154,6 +165,8 @@ public sealed class WeatherRuleEngine
     static double DailyMetricFromSnap(string metric, DaySnap snap) => metric switch
     {
         "temp_max" => snap.TempMax, "temp_min" => snap.TempMin,
+        "uv" => snap.Uv >= 0 ? snap.Uv : double.NaN,
+        "precip_mm" => snap.PrecipMm >= 0 ? snap.PrecipMm : double.NaN,
         "weather_code" => snap.Code,
         _ => double.NaN,
     };

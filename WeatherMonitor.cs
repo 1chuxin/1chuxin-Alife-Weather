@@ -22,6 +22,8 @@ public sealed class DaySnap
     public double TempNow { get; set; }
     public int Code { get; set; }
     public string Desc { get; set; } = "";
+    public double Uv { get; set; } = -1;        // 日紫外线极值（day_over_day 对比用）
+    public double PrecipMm { get; set; } = -1;  // 日降水量
 }
 
 public sealed class MonitorState
@@ -173,7 +175,8 @@ public sealed class WeatherMonitor(
         {
             try { result[city] = await module.QWeather.GetWarningsAsync(city, ct); }
             catch (OperationCanceledException) { throw; }
-            catch (Exception ex) { WarnOnce($"和风预警获取失败（{city}）：{ex.Message}"); result[city] = []; }
+            // 失败城市不放入 result（与"确实无预警"区分）：WarningCycle 对缺失城市整城跳过，防止误推"预警解除"
+            catch (Exception ex) { WarnOnce($"和风预警获取失败（{city}）：{ex.Message}"); }
         }
         return result;
     }
@@ -200,11 +203,19 @@ public sealed class WeatherMonitor(
         {
             foreach (var city in cities)
             {
-                if (!byCity.TryGetValue(city, out var alarms)) alarms = [];
+                // 取数失败的城市不在 byCity 里：整城跳过（不评新增、不判解除），等下一轮
+                if (!byCity.TryGetValue(city, out var alarms)) continue;
                 var known = _state.Announced.TryGetValue(city, out var s) ? s : new List<string>();
+                var now0 = DateTime.Now;
 
-                foreach (var a in alarms.Where(a => !known.Contains(a.AlertId)))
+                foreach (var a in alarms.Where(a => a.EndTime == null || a.EndTime > now0))
                 {
+                    if (known.Contains(a.AlertId)) continue;
+                    // 变更归并（DESIGN.md §11.5）：新 id 若取代已播报的旧 id，视为"更新"而非"新增"，
+                    // 旧 id 当场移出已播报集合 → 后面的解除判定不会为其补推"解除"
+                    var olds = a.Supersedes?.Where(known.Contains).ToList() ?? [];
+                    foreach (var oldId in olds) known.Remove(oldId);
+                    a.IsUpdate = olds.Count > 0;
                     known.Add(a.AlertId);
                     if (!baselineMode)
                     {
@@ -212,12 +223,13 @@ public sealed class WeatherMonitor(
                         newAlertsCities[a] = city;
                     }
                 }
-                if (!baselineMode && Cfg.NotifyOnClear)
-                    foreach (var gone in known.Where(id => alarms.All(x => x.AlertId != id)).ToList())
-                    {
-                        known.Remove(gone);
+                // 解除"检测"与"通知"解耦：消失的 id 始终移出已播报集合（防 state 无界增长），是否播报看 NotifyOnClear
+                foreach (var gone in known.Where(id => alarms.All(x => x.AlertId != id)).ToList())
+                {
+                    known.Remove(gone);
+                    if (!baselineMode && Cfg.NotifyOnClear)
                         msgs.Add($"[P0·预警解除] {city}\n此前的一条预警已从生效列表中消失（可能已解除）。可再向用户提一句。");
-                    }
+                }
                 _state.Announced[city] = known;
             }
         }
@@ -233,7 +245,9 @@ public sealed class WeatherMonitor(
                 var city2 = newAlertsCities[a];
                 var detailLine = a.Detail.Length > 0 ? $"\n正文：{WeatherTexts.Truncate(a.Detail, 200)}" : "";
                 var urlLine = a.Detail.Length == 0 && a.Url.Length > 0 ? $"\n详情：https://www.nmc.cn{a.Url}" : "";
-                msgs.Add($"[P0·预警] {city2}\n{a.Title}（发布 {a.IssueTime}）{detailLine}{urlLine}\n请适时提醒用户注意安全，酌情安排出行建议。");
+                var head = a.IsUpdate ? "[P0·预警更新]" : "[P0·预警]";
+                var sender = a.SenderName.Length > 0 ? a.SenderName + " " : "";
+                msgs.Add($"{head} {city2}\n{sender}{a.Title}（发布 {a.IssueTime}）{detailLine}{urlLine}\n请适时提醒用户注意安全，酌情安排出行建议。");
             }
         }
         SaveState();
@@ -262,11 +276,26 @@ public sealed class WeatherMonitor(
         foreach (var city in cities)
         {
             ct.ThrowIfCancellationRequested();
-            var data = await GetWeatherAsync(city, ct);
+            WeatherData? data;
+            try { data = await GetWeatherAsync(city, ct); }
+            // per-city 隔离：单个城市失败（城市名无法解析/配额/网络）只跳过该城，不中止整轮规则评价
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { WarnOnce($"天气数据获取失败（{city}）：{ex.Message}"); continue; }
             if (data == null) { WarnOnce($"天气数据获取失败（{city}），本轮跳过"); continue; }
             if (city == Cfg.DefaultCity) defaultCityData = data;
 
             UpdateSnapshots(city, data);
+
+            // 历史兜底：本地昨日快照缺失（重装/首次跨天）时用时光机补齐，day_over_day 规则不哑一天
+            if (State.Yesterday(city) == null && Cfg.QuerySource == "qweather")
+                await TryFillYesterdayAsync(city, ct);
+            // 空气质量：慢变数据（2h 缓存），附加后 aqi 规则指标与状态轨可用
+            if (Cfg.EnableAirQuality && Cfg.QuerySource == "qweather")
+            {
+                try { data.Air = await module.QWeather.GetAirAsync(city, ct); }
+                catch (OperationCanceledException) { throw; }
+                catch { /* 空气质量失败不影响主链路 */ }
+            }
 
             var hasWarning = alarmsByCity.TryGetValue(city, out var al) && al.Count > 0;
             foreach (var hit in module.Engine.Evaluate(Cfg.Rules, city, data,
@@ -282,13 +311,22 @@ public sealed class WeatherMonitor(
                 }
 
                 string text = $"[P0·{hit.Rule.Name}] {city}\n{hit.Text}\n请酌情提醒用户。";
-                if (hit.Rule.Metric == "precip_prob" && data.Days.FirstOrDefault()?.Hourly.Max(h => h.ThunderProb) >= 50)
+                if (hit.Rule.Metric == "precip_prob" && data.Days.FirstOrDefault()?.Hourly is { Count: > 0 } thunderHours
+                    && thunderHours.Max(h => h.ThunderProb) >= 50)
                     text = text.Replace("请酌情提醒用户。", "同时雷暴概率较高，请注意。\n请酌情提醒用户。");
                 bool downgraded = hasWarning && hit.Rule.IsBuiltin && hit.Rule.Metric != "weather_code";
                 if (downgraded || hit.Rule.Level == "silent")
                     silentNotes.Add($"（{hit.Rule.Name}：{hit.Text}）");
                 else
                     pushMsgs.Add(text);
+            }
+
+            // 临近降雨（触发式，DESIGN.md §11.4）：逐时概率先判，命中才拉分钟级数据
+            if (Cfg.QuerySource == "qweather" && Cfg.EnableRainNowcast)
+            {
+                try { await CheckRainNowcastAsync(city, data, ct); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { logger.LogWarning(ex, "临近降雨检查失败（{City}）", city); }
             }
         }
         if (noDataMetrics.Count > 0)
@@ -327,7 +365,9 @@ public sealed class WeatherMonitor(
         var snap = new DaySnap
         {
             Date = date, TempMax = todayF?.MaxC ?? data.Now.Temp, TempMin = todayF?.MinC ?? data.Now.Temp,
-            TempNow = data.Now.Temp, Code = data.Now.Code, Desc = WeatherTexts.CodeCnOf(data.Now.Code),
+            TempNow = data.Now.Temp, Code = data.Now.Code,
+            Desc = !string.IsNullOrEmpty(data.Now.Text) ? data.Now.Text : WeatherTexts.CodeCnOf(data.Now.Code),
+            Uv = todayF?.Uv ?? -1, PrecipMm = todayF?.PrecipMm ?? -1,
         };
         lock (_gate)
         {
@@ -344,6 +384,8 @@ public sealed class WeatherMonitor(
                         TempNow = records[^1].TempNow,
                         Code = records[records.Count / 2].Code,
                         Desc = records[records.Count / 2].Desc,
+                        Uv = records.Where(x => x.Uv >= 0).Select(x => x.Uv).DefaultIfEmpty(-1).Max(),
+                        PrecipMm = records[^1].PrecipMm,
                     };
                 _state.Baselines[city] = snap;
                 _state.DayRecords[city] = [snap];
@@ -373,6 +415,56 @@ public sealed class WeatherMonitor(
     }
 
     MonitorState State => _state; // 引擎读取快照用（在锁外读，字段级竞争可容忍：最坏跳过一轮）
+
+    readonly HashSet<string> _histTried = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>历史兜底（DESIGN.md §11.5）：本地昨日快照缺失时拉一次时光机历史补齐（每城市每次运行只试一次）。</summary>
+    async Task TryFillYesterdayAsync(string city, CancellationToken ct)
+    {
+        if (!_histTried.Add(city)) return;
+        try
+        {
+            var baseDate = DateTime.TryParse(State.Baseline(city)?.Date, out var bd) ? bd : DateTime.Today;
+            var yd = baseDate.AddDays(-1);
+            if (yd < DateTime.Today.AddDays(-10)) return;   // 时光机只覆盖过去 10 天
+            var h = await module.QWeather.GetHistoryAsync(city, yd, ct);
+            if (h == null || h.TempMax <= -900) return;
+            lock (_gate)
+                _state.Yesterday[city] = new DaySnap
+                {
+                    Date = yd.ToString("yyyy-MM-dd"),
+                    TempMax = h.TempMax, TempMin = h.TempMin, TempNow = h.TempMin,
+                    Code = h.Code, Desc = h.Desc, PrecipMm = h.Precip,
+                };
+            logger.LogInformation("城市 {City} 的昨日快照由时光机历史数据补齐（{Date}）", city, yd.ToString("yyyy-MM-dd"));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { logger.LogWarning(ex, "历史数据补齐昨日快照失败（{City}）", city); }
+    }
+
+    /// <summary>临近降雨推送：未来 3h 逐时概率 ≥50% 且当前无雨 → 拉分钟级降水精确定时，12h 冷却/城市。</summary>
+    async Task CheckRainNowcastAsync(string city, WeatherData data, CancellationToken ct)
+    {
+        if (data.Now.PrecipMm > 0.05) return;   // 已经在下雨，无需"临近"提醒
+        var window = data.HourlyFlat.Where(h => h.Ts >= DateTime.Now && h.Ts <= DateTime.Now.AddHours(3)).ToList();
+        if (window.Count == 0 || window.Max(h => h.RainProb) < 50) return;
+
+        string key = $"{city}:__rainnowcast__";
+        lock (_gate)
+        {
+            if (_state.FiredAt.TryGetValue(key, out var last) && (DateTime.Now - last).TotalHours < 12) return;
+        }
+        var mi = await module.QWeather.GetMinutelyAsync(city, ct);
+        if (mi is not { Supported: true } || mi.Items.Count == 0) return;
+        var first = mi.Items.FirstOrDefault(p => p.Precip > 0);
+        if (first == null) return;   // 数据说两小时内没雨（逐时概率虚高）
+        lock (_gate) _state.FiredAt[key] = DateTime.Now;
+        SaveState();
+
+        int mins = Math.Max(1, (int)Math.Round((first.FxTime - DateTime.Now).TotalMinutes));
+        string kind = first.Type == "snow" ? "下雪" : "下雨";
+        await DispatchAsync([$"[P0·临近降雨] {city}\n约 {mins} 分钟后开始{kind}（未来两小时：{mi.Summary}）。\n请提醒用户带伞、调整出行安排。"], ct);
+    }
 
     #endregion
 
@@ -430,17 +522,35 @@ public sealed class WeatherMonitor(
             sb.Append($"[P2·晨报] 早上好，今日天气：{Cfg.DefaultCity} ");
             sb.Append(WeatherTexts.CodeCnOf(data.Now.Code));
             var todayF = data.Days.FirstOrDefault();
-            if (todayF != null) sb.Append($"，{todayF.MinC:0.#}~{todayF.MaxC:0.#}°C");
-            if (State.Yesterday.TryGetValue(Cfg.DefaultCity, out var y))
+            if (todayF != null && todayF.MaxC > -900) sb.Append($"，{todayF.MinC:0.#}~{todayF.MaxC:0.#}°C");
+            if (State.Yesterday.TryGetValue(Cfg.DefaultCity, out var y) && todayF is { MaxC: > -900 })
             {
-                double delta = todayF?.MaxC - y.TempMax ?? 0;
+                double delta = todayF.MaxC - y.TempMax;
                 if (Math.Abs(delta) >= 3) sb.Append($"（较昨日最高温{(delta > 0 ? "升" : "降")} {Math.Abs(delta):0.#}°C）");
             }
             if (todayF != null && todayF.Hourly.Count > 0)
             {
                 int rain = todayF.Hourly.Max(h => h.RainProb);
                 if (rain >= 30) sb.Append($"；今日降水概率最高 {rain}%");
-                sb.Append($"；日出 {todayF.Sunrise:HH:mm}，日落 {todayF.Sunset:HH:mm}");
+                if (todayF.Sunrise != default && todayF.Sunset != default)
+                    sb.Append($"；日出 {todayF.Sunrise:HH:mm}，日落 {todayF.Sunset:HH:mm}");
+            }
+            // 和风源扩展：空气质量 / 穿衣指数 / 月相（失败静默缺席，不影响晨报主文）
+            if (Cfg.QuerySource == "qweather")
+            {
+                if (Cfg.EnableAirQuality)
+                {
+                    var air = await module.QWeather.GetAirAsync(Cfg.DefaultCity, ct);
+                    if (air is { Aqi: >= 0 }) sb.Append($"；空气质量 {air.Category}（AQI {air.Aqi:0}）");
+                }
+                if (Cfg.EnableIndices)
+                {
+                    var idx = await module.QWeather.GetIndicesAsync(Cfg.DefaultCity, "3", 1, ct);
+                    var cloth = idx?.FirstOrDefault();
+                    if (cloth != null) sb.Append($"；穿衣{cloth.Category}");
+                }
+                string? moon = WeatherTexts.MoonCnOf(todayF?.MoonPhase ?? "");
+                if (moon != null) sb.Append($"；月相 {moon}");
             }
             sb.Append(alarms.Count > 0
                 ? $"。⚠ 当前有 {alarms.Count} 条生效预警：{string.Join("；", alarms.Take(3).Select(a => a.Title))}。请主动向用户播报。"

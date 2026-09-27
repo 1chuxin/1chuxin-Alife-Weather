@@ -561,8 +561,12 @@ public class WeatherModuleUI : ModuleUIBase<WeatherModule, WeatherConfig>
         AddTextInput(b, ref i, "和风 API 地址", Configuration.QWeatherApiHost,
             "新版账号在控制台复制专属地址；旧版用 devapi.qweather.com", "从和风控制台复制",
             v => Configuration.QWeatherApiHost = v.Trim());
+        AddSelect(b, ref i, "和风接口版本", Configuration.QWeatherApiVersion,
+            "v1 新一代接口字段最全（官方主推）；v7 旧版仅作故障回退",
+            new[] { ("v1", "v1 新一代（推荐）"), ("v7", "v7 旧版（回退用）") },
+            v => Configuration.QWeatherApiVersion = v);
         AddTextInput(b, ref i, "额外关注的城市", Configuration.WatchCities,
-            "多个城市用逗号隔开，例如：北京, 上海；留空 = 只看默认城市", null,
+            "多个城市用逗号隔开，例如：北京, 上海；建议不超过 5 个（免费额度）", null,
             v => Configuration.WatchCities = v);
         b.OpenElement(i++, "div");
         b.AddAttribute(i++, "class", "wx-grid2");
@@ -573,6 +577,19 @@ public class WeatherModuleUI : ModuleUIBase<WeatherModule, WeatherConfig>
             "下限 30；wttr 数据约一小时才更新一次",
             v => Configuration.ChangeCheckIntervalMinutes = Math.Max(30, (int)v));
         b.CloseElement(); // wx-grid2
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "wx-grid2");
+        AddSwitchRow(b, ref i, "空气质量", "AQI 规则指标、晨报与查询（2 小时缓存）",
+            Configuration.EnableAirQuality, v => Configuration.EnableAirQuality = v);
+        AddSwitchRow(b, ref i, "生活指数", "穿衣/洗车/运动等建议，晨报与查询（每日一次）",
+            Configuration.EnableIndices, v => Configuration.EnableIndices = v);
+        b.CloseElement(); // wx-grid2
+        AddSwitchRow(b, ref i, "临近降雨提醒", "可能下雨时精确提醒「约 X 分钟后开始下雨」（触发式）",
+            Configuration.EnableRainNowcast, v => Configuration.EnableRainNowcast = v);
+        b.OpenElement(i++, "div");
+        b.AddAttribute(i++, "class", "wx-panel-desc");
+        b.AddContent(i++, $"本月已实测 {CacheHub.MonthRequests()} 次和风请求（免费额度 50,000 次/月）");
+        b.CloseElement();
         b.CloseElement(); // wx-panel
     }
 
@@ -712,8 +729,17 @@ public class WeatherModuleUI : ModuleUIBase<WeatherModule, WeatherConfig>
         b.AddAttribute(i++, "style", "display:flex;gap:8px;margin-top:12px");
         AddBtn(b, ref i, "完成", "wx-btn", () =>
         {
+            var err = e.Validate();
+            if (err != null)
+            {
+                _testOk = false;   // 即时校验：非法组合（如 now/today + changed）当场上报，不留到重启才被禁用
+                _testResult = $"规则未保存：{err}";
+                StateHasChanged();
+                return;
+            }
             _editing = null;
             _backup = null;
+            _testResult = "";
             StateHasChanged();
         });
         AddBtn(b, ref i, "取消", "wx-btn ghost", () =>
@@ -847,7 +873,7 @@ public class WeatherModuleUI : ModuleUIBase<WeatherModule, WeatherConfig>
         ("temp", "气温"), ("feels_like", "体感"), ("temp_max", "最高温"), ("temp_min", "最低温"),
         ("humidity", "湿度"), ("wind_speed", "风速"), ("uv", "紫外线"),
         ("precip_mm", "降水量"), ("precip_prob", "降水概率"), ("thunder_prob", "雷暴概率"),
-        ("weather_code", "天气现象")
+        ("weather_code", "天气现象"), ("aqi", "空气质量AQI")
     };
 
     static (string v, string t)[] OpOpts() => new[]

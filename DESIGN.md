@@ -106,7 +106,7 @@ chuxin.Weather/
 
 ### 3.3 可选升级：和风天气（配 Key）与 Open-Meteo（扩展位）
 
-- **和风**：按 LocationID 精确匹配、预警含正文/级别/发布单位、7 天预报。端点 `/v7/weather/now|3d|7d`、`/v7/warning/now`、GeoAPI；免费版 host `devapi.qweather.com`（可配置）；鉴权 API Key（`X-QW-Api-Key` 头）。
+- **和风**：按 LocationID 精确匹配、预警含正文/级别/发布单位、7 天预报。端点 `/v7/weather/now|3d|7d`、`/v7/warning/now`、GeoAPI；免费版 host `devapi.qweather.com`（可配置）；鉴权 API Key（`X-QW-Api-Key` 头）。**2026-09-27 文档核对：官方已标注 v7 城市版"即将弃用"，主推新一代坐标系 API `weather/v1`（本账号实测用现有 Key 直通）；v1 化与整体数据利用设计见 §11。**
 - **Open-Meteo（v1 不实现）**：无 Key、7–16 天预报、自带 geocoding、无中国预警。
 
 ### 3.4 源选择配置
@@ -137,7 +137,7 @@ chuxin.Weather/
 | 中国天气网 d1.weather.com.cn | 未实测（需 Referer 伪造+GBK 解码+JS 变量剥离，`weather_index/{城市ID}.html` 含 alert 字段，城市 ID 需查表） | nmc 预警的备用源，但工程量/稳定性比差；仅在 nmc 失效时考虑 |
 | 华风爱科 platform.weathercn.com | 未实测（需免费注册，每日 500 次） | 中国气象局×AccuWeather 官方：分钟级降水+灾害预警——**愿意注册 Key 时比和风更"官方"的中国方案** |
 
-## 4. AI 函数设计（3 个 OneShot）
+## 4. AI 函数设计（v2：9 查询 + 1 设置，矩阵见 §11.3；本节为初版 4 函数的语义说明）
 
 注册照官方模板：`OnAwake` 里 `RegisterHandler(new XmlHandler(this){...}, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken)`；结果统一 `interactor.Poke()` 回给 AI。
 
@@ -391,3 +391,121 @@ OnStart:  基线拉取——当前已生效预警记为"已播报"（AnnounceOnS
 - **P1 注入与记忆压缩共存**：`Prompt()` 通道若确认可用则天然规避（常驻内容在提示词区不在历史）；`EditChatHistory` 回退方案可能被 Memory 压缩机制处理——实现阶段验证，必要时提高注入频率补偿。
 - **razor UI 构建链**：需要本地 .NET SDK 预编译 g.cs，改 UI 后要重编译再同步插件——开发期稍繁琐，产物结构官方已验证可行。
 - **待确认**：① 插件 ID 是否从 `Xiaoqian.Weather` 统一改为 `chuxin.*`（与 chuxin.TokenStats 一致）？② 默认城市设哪？（配置项，不阻塞开发）
+
+## 11. 数据接入方案 v2（2026-09-27 定稿：免费组全量兼容 + 3 分钟查询缓存）
+
+本章回答四个问题：**适配哪些 API、什么时候拿什么数据、AI 能查到什么、缓存怎么管**。
+依据：和风官方文档核对（两代 API 并存、v7 城市版"即将弃用"、按量计费分组）+ 本机对关键端点的只读实测（当前账号、现有 Key、免费订阅）。
+**硬约束**：和风按量计费中"台风和海洋""太阳辐照"两组无免费额度，**一律不接**；"天气和基础服务"组（天气预报/分钟预报/预警/天气指数/空气质量/时光机/GeoAPI/天文/控制台API）共享 0–50000 次/月免费额度。
+**v2 目标（相对初版 §11 的升级）**：①免费组九类服务全量适配；②AI 查询函数覆盖全部数据域（让 AI 能查到尽可能详细的信息）；③查询函数缓存统一 **3 分钟**（用户指定；上游更新频率均慢于 3 分钟，缓存零信息损失）。
+
+### 11.1 客户端层：九个领域客户端（统一归一化）
+
+和风客户端按数据域拆分，全部经过同一归一化层后进入内部模型；除标"可选"外均为必做。**2026-09-27 已用当前账号（免费订阅 + X-QW-Api-Key）对文峰区全量实测，除控制台 API 外全部 200**：
+
+| 客户端 | 端点 | 免费组 | 实测返回（2026-09-27，文峰区） |
+|---|---|---|---|
+| WeatherClient | `weather/v1/current\|hourly\|daily/{lat}/{lon}`（v7 同域回退，已实测） | 天气预报 | 实况 / 逐时 1–240h / 逐日 1–10d |
+| MinutelyClient | `v7/minutely/5m?location=经度,纬度`（实测 200） | 分钟预报 | `summary` 一句话 + 24×5min `precip`/`type`；仅中国城市 |
+| AlertClient | `weatheralert/v1/current/{lat}/{lon}`（实测 200） | 预警 | 生效预警 + supersedes/时效（nmc 独立源并存不变） |
+| AirQualityClient | `airquality/v1/current/{lat}/{lon}`（实测 200） | 空气质量 | `indexes[]`（国标 cn-mee AQI/类别/首要污染物/健康建议）+ `pollutants[]`（pm2p5/pm10/no2/o3/so2/co 浓度） |
+| IndicesClient | `v7/indices/{1d\|3d}?type=…&location=…`（实测 200） | 天气指数 | `daily[]`：type/name/level/category/text（建议原文） |
+| TimeMachineClient | `v7/historical/weather?location={ID}&date=yyyyMMdd`（实测 200，API Key 可用） | 时光机 | `weatherDaily`（温度极值/湿度/降水/气压/日月）+ `weatherHourly[24]`；过去 10 天、不含当日 |
+| AstroClient | `v7/astronomy/sun\|moon?location&date`（实测 200） | 天文 | **单日期计价**（sun/moon 各 1 次/日期，60 天内）；sun=日出日落，moon=月出月落+逐时月相（name/illumination）。日常走 `daily.astro` 零请求，独立端点仅查询补位 |
+| GeoClient | `geo/v2/city/lookup`（实测 200） | GeoAPI | 城市→ID/坐标（文峰区=101180206, 36.10/114.35），磁盘持久缓存 |
+| ConsoleClient（可选†） | 额度/用量查询（未实测） | 控制台API | 实测剩余额度；若 API Key 无权限则退回本地计数 |
+
+**归一化层映射规则**（单位/语义陷阱在此收口，内部模型不变）：
+
+| 上游字段 | 内部模型 | 换算 |
+|---|---|---|
+| v1 `condition.code` / v7 `icon`/`iconDay` | `Code`（WWO）+ `Desc`（和风原文） | 静态"和风码→WWO 码"表（~30 行）；**取代中文 text 反推** |
+| v1 `precipitation.probability`（0–1） | `RainProb`（0–100） | ×100 |
+| v1 `humidity`（0–1） | `Humidity`（0–100） | ×100 |
+| v1 `wind.speed`（m/s） | `WindKph` | ×3.6 |
+| `forecastTime`/`forecastStartTime`（UTC ISO） | 本地日期/时刻 | 转本地时区 |
+| uv | `Now.Uv`＝`current.uvIndex`；日级＝`daily.uvIndexMax` | v7 回退时用 `daily[0].uvIndex`（实测存在） |
+
+### 11.2 缓存架构 CacheHub（v2 核心）
+
+**原则：上游更新远慢于询问频率，缓存是额度安全与响应速度的根基。**
+
+- **统一存储**：`CacheHub`（进程内，键=领域+城市+参数规范化）；单飞并发去重（同键同时只放一个请求，其余等结果）；城市变更即清该城市全部键。
+- **AI 查询路径：统一 TTL = 3 分钟**。任何查询函数读缓存：条目 ≤3min 直接命中，过期才拉取刷新。各域上游实际更新频率（实况 10min 级、逐时/逐日小时级、AQI 小时级、指数每日、历史每日）都慢于 3min——3 分钟内重复查询零请求、零信息损失。
+- **后台周期路径**：按自己的节拍写同一缓存，查询路径同样受益（预警轮询 30min、变化检测 60min、AQI 2h、指数 24h、历史 12h、天文 24h、分钟级触发后 30min 冷却）。
+- **额度护栏**：CacheHub 实测计数（按日/按域）；UI 数据源页显示"本月实测 N 次 / 50000 免费"（替代估算），超 80% 提示收敛。
+
+### 11.3 查询函数矩阵：AI 可查 = 免费组全量
+
+9 个查询函数 + 1 个设置函数（新增 5 个，升级 4 个）。返回全部为纯文本 Poke，超长按行数上限截断并注明；**数据域不支持（如海外城市无分钟级）时返回明确一句说明，让 AI 自然转述**：
+
+| 函数 | 参数 | 返回（AI 所见） | 数据域 |
+|---|---|---|---|
+| query_weather | city? | 实况全套：现象/温度/体感/湿度/风向风速+蒲福级/阵风/紫外线/最近1h雨量/能见度/气压/云量/露点 + AQI 简行 + 未来 3h 降水概率 + 即将降雨时附分钟级行 | 天气+空气+分钟 |
+| query_forecast | city?, days≤10 | 逐日：昼夜现象/温度极值/降水概率+量/紫外线/湿度/风 + 日出日落/月相 | 天气(daily) |
+| query_hourly（新） | city?, hours≤240 | 逐时温度/现象/降水概率+量/紫外线/风；hours>72 按 3h 聚合返回；行数上限 40 | 天气(hourly) |
+| query_rain（新） | city? | 未来 2h 分钟级降雨：开始时间/强度曲线摘要；非中国城市明确告知不支持 | 分钟预报 |
+| query_warning | city? | 生效预警（supersedes 归并、过期过滤、正文） | 预警 |
+| query_air（新） | city? | 国标+美标 AQI、分项污染物、类别与健康建议 | 空气质量 |
+| query_indices（新） | city?, type?, days≤3 | 生活指数：级别+建议文字（type 可多选，默认穿衣/洗车/运动/感冒） | 天气指数 |
+| query_astro（新） | city?, days≤10 | 日出日落/三段晨昏蒙影/月相/月出月落 | 天文（daily.astro 优先） |
+| query_history（新） | city?, days≤10 | 过去 N 天逐日实况回顾（温度极值/现象/降水） | 时光机 |
+| set_default_city | city | 换默认城市（探测合法性→切配置→重置基线→刷上下文），语义不变 | GeoAPI |
+
+### 11.4 抓取计划：什么时候拿什么数据（后台路径）
+
+**"天气包"（bundle）**：一次变化检测 = 实况 + 逐时 72h + 逐日 3d，3 个请求拿齐，是周期功能的共同原料。
+
+| 数据 | 时机 | 缓存 TTL | 消费方 |
+|---|---|---|---|
+| 实况/逐时/逐日（bundle） | 变化检测每轮 + 启动 + 晨报前 | 3min（查询共享） | 状态轨、intraday/逐时规则、P1 上下文、晨报 |
+| 预警 | 预警轮询（默认 30min）+ 变化检测顺带 | 10min | P0 推送、冲突抑制、晨报 |
+| 空气质量 | 并入 bundle 节拍 | 2h | AQI 规则指标、晨报、状态轨 |
+| 天气指数 | 每日 1 次（晨报时） | 24h | 晨报 |
+| 分钟降水 | **触发式**：未来 3h pop≥50% 且当前无雨才拉 | 触发后 30min 冷却 | "约 X 分钟后开始下雨"推送、query_rain |
+| 天文 | 不单独请求（daily.astro） | 24h | 晨报、query_astro |
+| 历史 | 不周期拉：本地快照为主 | 12h | day_over_day、query_history、冷启动兜底 |
+| Geo | 城市变更时 | 永久 | 全部和风寻址 |
+
+**节拍原则**：抓取频率对齐数据更新频率；额度紧张先砍指数后砍 AQI、绝不动预警轮询。静默时段只抑制推送不抑制抓取。
+
+### 11.5 后台功能映射与规则指标
+
+功能映射：状态轨（本地快照+AQI 缓存，零网络）、P0 预警（supersedes 归并：新预警 supersedes 含已播报 id → 视为变更更新推送而非新增；EndTime 已过不推；解除只认"消失且未被取代"）、P1 上下文（+AQI 简值）、晨报（bundle+指数+AQI+月相）、临近降雨推送（12h 冷却/城市）、**历史兜底（新）**：day_over_day 规则在本地昨日快照缺失（重装/首次跨天）时拉时光机昨日实况补齐，规则不因冷启动哑一天。
+
+规则指标矩阵在初版基础上**新增 `aqi`（now 窗口）**——"AQI>150 推送"立即可用；其余点亮情况（uv/precip_mm/tomorrow 降水概率、thunder_prob 和风源按天气码 302/303/304 推导并标注"推导值"）不变。
+
+### 11.6 请求预算（2026-09-27 按实测端点精算）
+
+后台路径（1 城市，当前配置 30min 预警 / 60min 变化检测 / 晨报开启）：
+
+| 项 | 次/天 | 次/月 |
+|---|---|---|
+| 变化检测 bundle（实况+逐时72+逐日3） | 24×3 = 72 | 2,160 |
+| 预警轮询 | 48 | 1,440 |
+| 空气质量（2h TTL） | 12 | 360 |
+| 生活指数（每日） | 1 | 30 |
+| 触发式分钟级（均值，约三分之一天数触发 1–2 次） | ~0.5 | ~15 |
+| 历史/天文/Geo | ~0 | ~5 |
+| **后台小计** | **~134** | **~4,000** |
+| AI 查询（30 次/天 × 1.5 端点，3min TTL 命中过半） | 25–45 | 750–1,350 |
+| **合计** | **~160–180** | **~4,800–5,400（占额度 10–11%）** |
+
+多城市：WatchCities=5 → ~700/天 ≈ 21k/月（42%），仍免费；**10 城市将达 ~42k/月逼近上限 → WatchCities 上限定 5**。UI 显示 CacheHub 实测数。
+
+### 11.7 降级链与容错
+
+查询：v1 → v7 自动回退（同 Key）→ 本轮跳过；预警不自动切 nmc（id 体系不同，切换必须显式）；分钟级/天文/历史失败或城市不支持 → 函数明确告知、推送路径静默缺席；可选优化：`metadata.tag` 未变跳过重处理。
+
+### 11.8 实现面清单（v2，本次仅设计）
+
+> **实现记录（2026-09-27，v4.3.0）**：本章方案已全量落地并热重载验证通过——`CacheHub.cs`（统一缓存/单飞/TTL 分档/按月实测计数）、`WeatherQWeatherV1.cs`（v1 归一化 + 和风码→WWO 码表 + 分钟级/空气/指数/历史/天文五域客户端）、`WeatherClients.cs`（v7 降为回退路径并补齐扩展字段）、模型扩展（CurrentObs/HourPoint/DayForecast/NmcAlarm supersedes/WeatherData.Air+HourlyFlat/DaySnap.Uv+PrecipMm）、引擎新指标 `aqi` 与 hourly/today/tomorrow 的 precip_mm/uv/precip_prob 分支、10 个查询函数（query_weather/forecast/hourly/rain/air/indices/astro/history/warning + set_default_city）、Monitor 临近降雨触发器（12h 冷却）/历史兜底/晨报 AQI+穿衣+月相/预警 supersedes 防重与过期过滤、配置 4 项（接口版本/空气/指数/临近降雨）与 UI 对应控件 + 本月额度实测显示。GeoClient 采用进程内缓存（原设计"磁盘持久"简化——每次进程启动每城市仅 1 次解析请求，额度影响为零）。角色上下文实测：v1 链路注入"文峰区：阴 24.2°C…明日：小雨 18.3~22.4°C"，码表与明日降水概率工作正常。
+> **事故与修复（2026-09-27）**：CacheHub 初版 `GetOrLoadAsync` 在缓存过期后存在**自旋死循环**——`ConcurrentDictionary.TryAdd` 撞上未移除的过期条目必然失败，而 loader 已在 TryAdd 前发起，形成"无限打请求+无限分配"的内存/额度双泄漏（AI 于 TTL 过期后调用函数时触发）。修复：过期条目先按"键+值"原子移除，loader 改由 TaskCompletionSource 承载且仅在抢注成功后发起，失败条目仅由胜者移除。同批复查其余生命周期（DayRecords 64 上限、FiredAt 7 天清理、NMC 正文缓存 800 上限、心跳 PeriodicTimer using 释放、热重载后旧静态缓存随程序集 GC）均无泄漏点。
+> **第三轮独立审查（2026-09-27，无高危）**：子代理全库独立审查后修复 5 中危 + 10 低危——①ChangeCycle per-city 异常隔离（单城失败不再瘫痪整轮规则评价）；②和风预警取数失败城市整城跳过（不再误推"预警解除"+恢复后重复推送）；③intraday changed 补 prev 基准（内置规则文案不再渲染"未知"）；④_locCache 改 ConcurrentDictionary（AI 查询与后台周期真实并发）；⑤晨报失败退避激活（心跳只推进 10 分钟，BriefDate 保证当天一次，瞬时失败不丢晨报）；低危含 now 窗口湿度/风速哨兵守卫、NMC 详情未命中不缓存、wttr 单位小时天文时间与日期 InvariantCulture 解析、weatherHourly 空数组守卫、CacheHub TTL 按完成时刻起算、NotifyOnClear=false 时已播报集合照常收缩、query_weather 预警数兜底、OnStart finally 放行心跳、规则编辑器完成时即时 Validate、上下文行现象优先原文。已接受不修：SafeAsync 静默降级无日志（查询侧有用户可见兜底文案）、海外城市逐时窗口时区偏差（CN 主场景）、CancelAfter 对共享 loader 不生效（单飞语义的固有取舍，HttpClient 30s/请求兜底）。
+
+1. `CacheHub`（新文件）：统一存储/单飞/TTL 分档/实测计数。
+2. `WeatherClients.cs`：九领域客户端 + 归一化层（和风码→WWO 表、单位换算）。
+3. `WeatherModule.cs`：函数矩阵注册（4 升级 + 5 新增）。
+4. `WeatherRuleEngine.cs`/`DaySnap`：aqi/uv/precip_mm 分支与快照字段。
+5. `WeatherMonitor.cs`：临近降雨触发器、晨报扩展、历史兜底、预警 supersedes 防重。
+6. `WeatherConfig` + UI：`QWeatherApiVersion`、各数据域开关、CacheHub 额度显示。

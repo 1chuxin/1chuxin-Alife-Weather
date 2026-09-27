@@ -22,6 +22,22 @@ public class WeatherConfig
     [Description("新版账号到控制台复制专属 API Host（形如 xxxxxxxx.re.qweatherapi.com）；旧版账号用 devapi.qweather.com（免费）/ api.qweather.com（付费）")]
     public string QWeatherApiHost { get; set; } = "https://devapi.qweather.com";
 
+    [DisplayName("和风接口版本")]
+    [Description("v1 = 新一代坐标系接口（默认，字段最全，官方主推）；v7 = 旧版城市接口（官方已标注即将弃用，仅作故障回退）")]
+    public string QWeatherApiVersion { get; set; } = "v1";
+
+    [DisplayName("空气质量数据")]
+    [Description("接入和风空气质量：AQI 规则指标、晨报与查询（2 小时缓存，消耗少）")]
+    public bool EnableAirQuality { get; set; } = true;
+
+    [DisplayName("生活指数数据")]
+    [Description("接入和风生活指数：晨报穿衣建议与 query_indices 查询（每日缓存一次）")]
+    public bool EnableIndices { get; set; } = true;
+
+    [DisplayName("临近降雨提醒")]
+    [Description("未来数小时可能降雨时，用分钟级降水精确提醒「约 X 分钟后开始下雨」（触发式，不下雨不耗请求）")]
+    public bool EnableRainNowcast { get; set; } = true;
+
     [DisplayName("默认城市")]
     [Description("查询缺省城市；AI 也可通过 set_default_city 修改")]
     public string DefaultCity { get; set; } = "北京";

@@ -18,7 +18,7 @@ public sealed class WeatherRule
     /// <summary>数据窗口：now / today / tomorrow / intraday / day_over_day / hourly_today</summary>
     public string Window { get; set; } = "now";
 
-    /// <summary>指标：temp / feels_like / temp_max / temp_min / humidity / wind_speed / uv / precip_mm / precip_prob / thunder_prob / weather_code</summary>
+    /// <summary>指标：temp / feels_like / temp_max / temp_min / humidity / wind_speed / uv / precip_mm / precip_prob / thunder_prob / weather_code / aqi</summary>
     public string Metric { get; set; } = "temp";
 
     /// <summary>操作符：&gt; / &gt;= / &lt; / &lt;= / == / changed（数值=变化量；weather_code=类别突变）</summary>
@@ -39,7 +39,7 @@ public sealed class WeatherRule
     public bool IsBuiltin { get; set; }
 
     public static readonly string[] ValidWindows = { "now", "today", "tomorrow", "intraday", "day_over_day", "hourly_today" };
-    public static readonly string[] ValidMetrics = { "temp", "feels_like", "temp_max", "temp_min", "humidity", "wind_speed", "uv", "precip_mm", "precip_prob", "thunder_prob", "weather_code" };
+    public static readonly string[] ValidMetrics = { "temp", "feels_like", "temp_max", "temp_min", "humidity", "wind_speed", "uv", "precip_mm", "precip_prob", "thunder_prob", "weather_code", "aqi" };
     public static readonly string[] ValidOps = { ">", ">=", "<", "<=", "==", "changed" };
 
     /// <summary>校验规则，返回错误描述；null = 合法。</summary>
@@ -50,6 +50,8 @@ public sealed class WeatherRule
         if (Array.IndexOf(ValidMetrics, Metric) < 0) return $"不支持的指标：{Metric}";
         if (Array.IndexOf(ValidOps, Op) < 0) return $"不支持的操作符：{Op}";
         if (Op == "changed" && Window == "now") return "now 窗口没有对比基准，不能用 changed（渐变对比请用 intraday）";
+        if (Op == "changed" && (Window == "today" || Window == "hourly_today"))
+            return "该窗口没有对比基准，不能用 changed（今天对比昨天请用「较昨天」窗口）";
         if (CooldownHours < 0) return "冷却时间不能为负";
         if (Level != "push" && Level != "silent") return $"分发级别只能是 push/silent，当前：{Level}";
         return null;

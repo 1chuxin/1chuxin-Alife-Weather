@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -23,15 +24,27 @@ public sealed class CurrentObs
     public double PrecipMm { get; set; }
     public int Code { get; set; }
     public DateTime ObsTime { get; set; }
+    // ── 扩展实况字段（和风 v1 归一化填充，wttr/v7 部分可用）──
+    public int WindScale { get; set; } = -1;       // 蒲福风级
+    public double WindGustKph { get; set; } = -1;
+    public double Pressure { get; set; } = -1;     // hPa
+    public double VisM { get; set; } = -1;         // 能见度（米）
+    public double Cloud { get; set; } = -1;        // 云量 %
+    public double Dew { get; set; } = -999;        // 露点 °C
+    public string Text { get; set; } = "";         // 数据源原文现象（和风中文；wttr 为空）
 }
 
 public sealed class HourPoint
 {
-    public int Time { get; set; }          // 0-21 点
+    public int Time { get; set; }          // 0-23 点
     public double TempC { get; set; }
     public int RainProb { get; set; }
     public int ThunderProb { get; set; }
     public int Code { get; set; }
+    // ── 扩展逐时字段 ──
+    public DateTime Ts { get; set; }       // 预报时刻（本地）；wttr 源=日期+小时
+    public double PrecipMm { get; set; } = -1;
+    public double Uv { get; set; } = -1;
 }
 
 public sealed class DayForecast
@@ -43,6 +56,20 @@ public sealed class DayForecast
     public DateTime Sunrise { get; set; }
     public DateTime Sunset { get; set; }
     public List<HourPoint> Hourly { get; set; } = new();
+    // ── 扩展日级字段（和风 v1 daily 归一化填充；-1/空 = 当前源无数据）──
+    public int NightCode { get; set; } = -1;
+    public string TextDay { get; set; } = "";
+    public string TextNight { get; set; } = "";
+    public double PrecipProb { get; set; } = -1;   // 全日降水概率 %
+    public double PrecipMm { get; set; } = -1;     // 全日降水量 mm
+    public double Uv { get; set; } = -1;           // 日紫外线极值
+    public double Humidity { get; set; } = -1;
+    public double WindKph { get; set; } = -1;
+    public DateTime CivilDawn { get; set; }        // 民用晨光/暮光
+    public DateTime CivilDusk { get; set; }
+    public DateTime Moonrise { get; set; }
+    public DateTime Moonset { get; set; }
+    public string MoonPhase { get; set; } = "";    // 和风英文标识（full-moon），显示时经 MoonCnOf 转中文
 }
 
 public sealed class WeatherData
@@ -51,6 +78,8 @@ public sealed class WeatherData
     public CurrentObs Now { get; set; } = new();
     public List<DayForecast> Days { get; set; } = new();
     public DateTime FetchedAt { get; set; }
+    public List<HourPoint> HourlyFlat { get; set; } = new();   // 跨天逐时平铺（临近降雨判定/query 用）
+    public AirInfo? Air { get; set; }                          // 空气质量（Monitor/查询按需附加）
 }
 
 public sealed class NmcAlarm
@@ -60,6 +89,11 @@ public sealed class NmcAlarm
     public string Title { get; set; } = "";
     public string Url { get; set; } = "";
     public string Detail { get; set; } = "";   // 正文（详情页抓取，可能为空）
+    // ── 和风 weatheralert 扩展（nmc 源为空）──
+    public List<string>? Supersedes { get; set; }   // 本条预警取代的历史预警 id（变更防重，DESIGN.md §11.5）
+    public DateTime? EndTime { get; set; }          // 失效时间（已过期不再推送/播报）
+    public string SenderName { get; set; } = "";    // 发布单位
+    public bool IsUpdate { get; set; }              // 推送时标记：由 supersedes 判定为"变更"而非"新增"
 }
 
 #endregion
@@ -112,19 +146,23 @@ public sealed class WttrClient(HttpClient http)
     {
         var d = new DayForecast
         {
-            Date = DateTime.Parse(S(e, "date") ?? DateTime.Today.ToString("yyyy-MM-dd")),
+            Date = DateTime.TryParse(S(e, "date"), CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var d0) ? d0 : DateTime.Today,
             MaxC = D(e, "maxtempC"), MinC = D(e, "mintempC"),
         };
         if (e.TryGetProperty("hourly", out var hourly))
             foreach (var h in hourly.EnumerateArray())
+            {
+                int hour = (int)D(h, "time") / 100;
                 d.Hourly.Add(new HourPoint
                 {
-                    Time = (int)D(h, "time") / 100,
+                    Time = hour,
+                    Ts = d.Date.AddHours(hour),
                     TempC = D(h, "tempC"),
                     RainProb = (int)D(h, "chanceofrain"),
                     ThunderProb = (int)D(h, "chanceofthunder"),
                     Code = (int)D(h, "weatherCode"),
                 });
+            }
         if (d.Hourly.Count > 0) d.DayCode = d.Hourly.OrderBy(h => Math.Abs(h.Time - 12)).First().Code;
         if (e.TryGetProperty("astronomy", out var astro) && astro.GetArrayLength() > 0)
         {
@@ -139,7 +177,9 @@ public sealed class WttrClient(HttpClient http)
     {
         ts = default;
         return !string.IsNullOrEmpty(s) && TimeSpan.TryParseExact(s.Trim(), "hh\\:mm\\ tt", CultureInfo.InvariantCulture, out ts)
-            || !string.IsNullOrEmpty(s) && TimeSpan.TryParseExact(s.Trim(), "hh\\:mm", CultureInfo.InvariantCulture, out ts);
+            || !string.IsNullOrEmpty(s) && TimeSpan.TryParseExact(s.Trim(), "h\\:mm\\ tt", CultureInfo.InvariantCulture, out ts)
+            || !string.IsNullOrEmpty(s) && TimeSpan.TryParseExact(s.Trim(), "hh\\:mm", CultureInfo.InvariantCulture, out ts)
+            || !string.IsNullOrEmpty(s) && TimeSpan.TryParseExact(s.Trim(), "h\\:mm", CultureInfo.InvariantCulture, out ts);
     }
 
     static string S(JsonElement e, string name) =>
@@ -248,10 +288,13 @@ public sealed class NmcAlarmClient(HttpClient http)
                     var html = await resp.Content.ReadAsStringAsync(ct);
                     var match = System.Text.RegularExpressions.Regex.Match(html, @"<p[^>]*>([^<]{30,})</p>");
                     var detail = match.Success ? System.Net.WebUtility.HtmlDecode(match.Groups[1].Value).Trim() : "";
-                    lock (_detailGate)
+                    if (match.Success)   // 未命中不缓存：留待下轮重试，避免正文被空串永久占坑
                     {
-                        if (_detailCache.Count > 800) _detailCache.Clear();
-                        _detailCache[a.AlertId] = detail;
+                        lock (_detailGate)
+                        {
+                            if (_detailCache.Count > 800) _detailCache.Clear();
+                            _detailCache[a.AlertId] = detail;
+                        }
                     }
                     a.Detail = detail;
                 }
@@ -266,105 +309,89 @@ public sealed class NmcAlarmClient(HttpClient http)
 
 /// <summary>
 /// 和风天气客户端（新一代专属 Host API，实测结构 2026-09）：
-/// /geo/v2/city/lookup（带 /geo 前缀）、/v7/weather/now|24h|3d|7d、
-/// /weatheralert/v1/current/{lat}/{lon}（新一代预警：正文+防御指南内置，按坐标精准匹配）、
+/// 传输层 v1 主 / v7 回退（DESIGN.md §11.1），经 CacheHub 统一缓存；
+/// 域方法分文件实现：本文件=天气包与预警，WeatherQWeatherV1.cs=v1 归一化与分钟级/空气/指数/历史/天文。
 /// 鉴权：X-QW-Api-Key 请求头。响应为 gzip（HttpClient 需开自动解压）。
 /// </summary>
-public sealed class QWeatherClient(HttpClient http, string host, string apiKey)
+public sealed partial class QWeatherClient(HttpClient http, string host, string apiKey, string apiVersion = "v1")
 {
-    readonly Dictionary<string, (string Id, double Lat, double Lon)> _locCache = new(StringComparer.OrdinalIgnoreCase);
+    // AI 查询与后台周期会并发命中（CacheHub 单飞在线程池并发跑 loader），必须用并发容器
+    readonly ConcurrentDictionary<string, QLoc> _locCache = new(StringComparer.OrdinalIgnoreCase);
 
-    public async Task<WeatherData> GetWeatherAsync(string city, CancellationToken ct, int forecastDays = 3)
+    public string ApiVersion { get; set; } = apiVersion;
+
+    /// <summary>天气包：实况 + 逐时 72h + 逐日 days 天（AI 查询与后台周期共用，3 分钟 TTL，DESIGN.md §11.4）。</summary>
+    public Task<WeatherData> GetWeatherAsync(string city, CancellationToken ct, int forecastDays = 3)
     {
-        var (id, _, _) = await ResolveLocationAsync(city, ct);
-        var data = new WeatherData { City = city, FetchedAt = DateTime.Now };
+        int days = Math.Clamp(forecastDays, 1, 10);
+        return CacheHub.GetOrLoadAsync<WeatherData>($"wx:{city}:{days}", CacheHub.QueryTtl,
+            () => LoadWeatherAsync(city, days), CancellationToken.None);
+    }
 
-        var nowRoot = await GetJsonAsync($"/v7/weather/now?location={id}", ct);
-        if (nowRoot.TryGetProperty("now", out var now))
+    async Task<WeatherData> LoadWeatherAsync(string city, int days)
+    {
+        if (ApiVersion != "v7")
         {
-            data.Now = new CurrentObs
+            try
             {
-                Temp = Num(now, "temp"),
-                Feels = Num(now, "feelsLike"),
-                Humidity = (int)Num(now, "humidity"),
-                WindDir = Str(now, "windDir"),
-                WindKph = Num(now, "windSpeed"),
-                PrecipMm = Num(now, "precip"),
-                Code = TextToCode(Str(now, "text")),
-                ObsTime = DateTimeOffset.TryParse(Str(now, "obsTime"), out var t) ? t.LocalDateTime : DateTime.Now,
-            };
+                var v1 = await GetWeatherV1Async(city, days);
+                if (v1.Now.Temp > -900 || v1.Days.Count > 0) return v1;
+                // v1 响应结构异常（关键字段全空）：按失败处理，降级 v7
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* v1 失败自动降级 v7 */ }
         }
-
-        int span = forecastDays <= 3 ? 3 : 7;
-        var dailyRoot = await GetJsonAsync($"/v7/weather/{span}d?location={id}", ct);
-        if (dailyRoot.TryGetProperty("daily", out var daily))
-            foreach (var day in daily.EnumerateArray())
-            {
-                data.Days.Add(new DayForecast
-                {
-                    Date = DateTime.TryParse(Str(day, "fxDate"), out var d0) ? d0 : DateTime.Today,
-                    MaxC = Num(day, "tempMax"),
-                    MinC = Num(day, "tempMin"),
-                    DayCode = TextToCode(Str(day, "textDay")),
-                    Sunrise = DateTime.TryParse($"{Str(day, "fxDate")} {Str(day, "sunrise")}", out var sr) ? sr : default,
-                    Sunset = DateTime.TryParse($"{Str(day, "fxDate")} {Str(day, "sunset")}", out var ss) ? ss : default,
-                });
-            }
-
-        // 24 小时逐小时（含逐小时降水概率/降水量）——按日期归入对应的 DayForecast
-        var hourlyRoot = await GetJsonAsync($"/v7/weather/24h?location={id}", ct);
-        if (hourlyRoot.TryGetProperty("hourly", out var hourly))
-            foreach (var h in hourly.EnumerateArray())
-            {
-                var fx = DateTimeOffset.TryParse(Str(h, "fxTime"), out var ft) ? ft.LocalDateTime : DateTime.Now;
-                var day = data.Days.FirstOrDefault(d => d.Date == fx.Date);
-                if (day == null) continue;
-                day.Hourly.Add(new HourPoint
-                {
-                    Time = fx.Hour,
-                    TempC = Num(h, "temp"),
-                    RainProb = (int)Num(h, "pop"),
-                    ThunderProb = 0,
-                    Code = TextToCode(Str(h, "text")),
-                });
-            }
+        var data = await GetWeatherV7Async(city, days);
+        if (data.Now.Temp <= -900 && data.Days.Count == 0)
+            throw new Exception($"和风天气返回数据结构异常（{city} 实况与预报均为空）");
         return data;
     }
 
-    public async Task<List<NmcAlarm>> GetWarningsAsync(string city, CancellationToken ct)
-    {
-        var (_, lat, lon) = await ResolveLocationAsync(city, ct);
-        var root = await GetJsonAsync($"/weatheralert/v1/current/{lat:0.##}/{lon:0.##}", ct);
-        var list = new List<NmcAlarm>();
-        if (root.TryGetProperty("alerts", out var alerts) && alerts.ValueKind == JsonValueKind.Array)
-            foreach (var a in alerts.EnumerateArray())
-            {
-                var detail = Str(a, "description");
-                var ins = Str(a, "instruction");
-                if (ins.Length > 0) detail += (detail.Length > 0 ? "\n" : "") + "防御指南：" + ins;
-                list.Add(new NmcAlarm
+    /// <summary>生效预警（CacheHub 10 分钟 TTL；AI 查询可传 3 分钟）。supersedes/时效/发布单位一并解析。</summary>
+    public Task<List<NmcAlarm>> GetWarningsAsync(string city, CancellationToken ct, TimeSpan? ttl = null)
+        => CacheHub.GetOrLoadAsync($"warn:{city}", ttl ?? CacheHub.WarningTtl, async () =>
+        {
+            var loc = await ResolveLocationAsync(city, CancellationToken.None);
+            var root = await GetJsonAsync($"/weatheralert/v1/current/{loc.Lat:0.##}/{loc.Lon:0.##}", CancellationToken.None);
+            var list = new List<NmcAlarm>();
+            if (root.TryGetProperty("alerts", out var alerts) && alerts.ValueKind == JsonValueKind.Array)
+                foreach (var a in alerts.EnumerateArray())
                 {
-                    AlertId = Str(a, "id"),
-                    Title = Str(a, "headline"),
-                    IssueTime = DateTimeOffset.TryParse(Str(a, "issuedTime"), out var t)
-                        ? t.LocalDateTime.ToString("yyyy-MM-dd HH:mm") : "",
-                    Url = "",
-                    Detail = detail,
-                });
-            }
-        return list;
-    }
+                    var detail = Str(a, "description");
+                    var ins = Str(a, "instruction");
+                    if (ins.Length > 0) detail += (detail.Length > 0 ? "\n" : "") + "防御指南：" + ins;
+                    var sup = new List<string>();
+                    if (a.TryGetProperty("messageType", out var mt) && mt.TryGetProperty("supersedes", out var ss) && ss.ValueKind == JsonValueKind.Array)
+                        foreach (var s in ss.EnumerateArray())
+                            if (s.ValueKind == JsonValueKind.String) sup.Add(s.GetString() ?? "");
+                    list.Add(new NmcAlarm
+                    {
+                        AlertId = Str(a, "id"),
+                        Title = Str(a, "headline"),
+                        IssueTime = DateTimeOffset.TryParse(Str(a, "issuedTime"), out var t)
+                            ? t.LocalDateTime.ToString("yyyy-MM-dd HH:mm") : "",
+                        Url = "",
+                        Detail = detail,
+                        Supersedes = sup,
+                        EndTime = DateTimeOffset.TryParse(Str(a, "expireTime"), out var ex) ? ex.LocalDateTime : null,
+                        SenderName = Str(a, "senderName"),
+                    });
+                }
+            return list;
+        }, CancellationToken.None);
 
-    async Task<(string Id, double Lat, double Lon)> ResolveLocationAsync(string city, CancellationToken ct)
+    async Task<QLoc> ResolveLocationAsync(string city, CancellationToken ct)
     {
         if (_locCache.TryGetValue(city, out var cached)) return cached;
         var root = await GetJsonAsync($"/geo/v2/city/lookup?location={Uri.EscapeDataString(city)}&number=1", ct);
         if (root.TryGetProperty("location", out var loc) && loc.GetArrayLength() > 0)
         {
             var l = loc[0];
-            var result = (Str(l, "id"),
+            var result = new QLoc(
+                Str(l, "id"),
                 double.TryParse(Str(l, "lat"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var la) ? la : 0,
-                double.TryParse(Str(l, "lon"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var lo) ? lo : 0);
+                double.TryParse(Str(l, "lon"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var lo) ? lo : 0,
+                Str(l, "country"));
             _locCache[city] = result;
             return result;
         }
@@ -389,22 +416,100 @@ public sealed class QWeatherClient(HttpClient http, string host, string apiKey)
         return root.Clone();
     }
 
-    static string Str(JsonElement e, string name) =>
+    internal static string Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
 
-    static double Num(JsonElement e, string name) =>
+    internal static double Num(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v)
             ? v.ValueKind == JsonValueKind.Number ? v.GetDouble()
               : double.TryParse(v.GetString(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d
               : -999
             : -999;
 
-    /// <summary>中文天气现象→WWO 近似代码（复用现有中文映射）。</summary>
-    static int TextToCode(string text) => text switch
+    /// <summary>中文天气现象→WWO 近似代码（v7 回退路径用；v1 主路径用 QCodeToWwo 代码表）。</summary>
+    internal static int TextToCode(string text) => text switch
     {
         "晴" => 113, "多云" => 116, "阴" => 119, "小雨" => 296, "中雨" => 302, "大雨" => 308,
         "暴雨" => 308, "阵雨" => 353, "雷阵雨" => 389, "雨夹雪" => 362, "小雪" => 368, "中雪" => 371,
         "大雪" => 371, "雾" => 248, "霾" => 143, "扬沙" => 143, "浮尘" => 143,
         _ => text.Contains("雪") ? 371 : text.Contains("雨") ? 296 : text.Contains("雷") ? 389 : 116
     };
+
+    // ── v7 旧版回退路径（官方已标注"即将弃用"，仅作 v1 故障兜底；字段补齐见 DESIGN.md §11.1）──
+
+    async Task<WeatherData> GetWeatherV7Async(string city, int days)
+    {
+        var ct = CancellationToken.None;
+        var (id, _, _, _) = await ResolveLocationAsync(city, ct);
+        var data = new WeatherData { City = city, FetchedAt = DateTime.Now };
+
+        var nowRoot = await GetJsonAsync($"/v7/weather/now?location={id}", ct);
+        if (nowRoot.TryGetProperty("now", out var now))
+        {
+            int iconCode = QCodeToWwo(Str(now, "icon"));
+            data.Now = new CurrentObs
+            {
+                Temp = Num(now, "temp"),
+                Feels = Num(now, "feelsLike"),
+                Humidity = (int)Num(now, "humidity"),
+                WindDir = Str(now, "windDir"),
+                WindKph = Num(now, "windSpeed"),
+                WindScale = (int)Num(now, "windScale"),
+                PrecipMm = Num(now, "precip"),
+                Pressure = Num(now, "pressure"),
+                VisM = Num(now, "vis") * 1000,
+                Cloud = Num(now, "cloud"),
+                Dew = Num(now, "dew"),
+                Code = iconCode > 0 ? iconCode : TextToCode(Str(now, "text")),
+                Text = Str(now, "text"),
+                ObsTime = DateTimeOffset.TryParse(Str(now, "obsTime"), out var t) ? t.LocalDateTime : DateTime.Now,
+            };
+        }
+
+        // v7 回退只用到 3d/7d（10d/15d/30d 端点部分订阅不放行）；超过 7 天的请求优雅降级为 7 天
+        int span = days <= 3 ? 3 : 7;
+        var dailyRoot = await GetJsonAsync($"/v7/weather/{span}d?location={id}", ct);
+        if (dailyRoot.TryGetProperty("daily", out var daily))
+            foreach (var day in daily.EnumerateArray().Take(days))
+            {
+                int iconDay = QCodeToWwo(Str(day, "iconDay"));
+                data.Days.Add(new DayForecast
+                {
+                    Date = DateTime.TryParse(Str(day, "fxDate"), out var d0) ? d0 : DateTime.Today,
+                    MaxC = Num(day, "tempMax"),
+                    MinC = Num(day, "tempMin"),
+                    DayCode = iconDay > 0 ? iconDay : TextToCode(Str(day, "textDay")),
+                    TextDay = Str(day, "textDay"),
+                    TextNight = Str(day, "textNight"),
+                    PrecipMm = Num(day, "precip"),
+                    Uv = Num(day, "uvIndex"),
+                    Humidity = Num(day, "humidity"),
+                    WindKph = Num(day, "windSpeedDay"),
+                    Sunrise = DateTime.TryParse($"{Str(day, "fxDate")} {Str(day, "sunrise")}", out var sr) ? sr : default,
+                    Sunset = DateTime.TryParse($"{Str(day, "fxDate")} {Str(day, "sunset")}", out var ss) ? ss : default,
+                });
+            }
+
+        var hourlyRoot = await GetJsonAsync($"/v7/weather/24h?location={id}", ct);
+        if (hourlyRoot.TryGetProperty("hourly", out var hourly))
+            foreach (var h in hourly.EnumerateArray())
+            {
+                var fx = DateTimeOffset.TryParse(Str(h, "fxTime"), out var ft) ? ft.LocalDateTime : DateTime.Now;
+                var day = data.Days.FirstOrDefault(d => d.Date == fx.Date);
+                if (day == null) continue;
+                int iconCode = QCodeToWwo(Str(h, "icon"));
+                data.HourlyFlat.Add(new HourPoint
+                {
+                    Time = fx.Hour,
+                    Ts = fx,
+                    TempC = Num(h, "temp"),
+                    RainProb = (int)Num(h, "pop"),
+                    PrecipMm = Num(h, "precip"),
+                    ThunderProb = Str(h, "text").Contains("雷") ? 100 : 0,
+                    Code = iconCode > 0 ? iconCode : TextToCode(Str(h, "text")),
+                });
+                day.Hourly.Add(data.HourlyFlat[^1]);
+            }
+        return data;
+    }
 }
